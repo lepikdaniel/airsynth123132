@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Air Hand Synth (Camera + Canvas)</title>
+  <style>
+    html, body { margin: 0; padding: 0; background:#111; color:#eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; height:100%; }
+    #app { display:flex; flex-direction:column; gap:8px; padding:10px; }
+    video { display:none; } /* We draw it to canvas instead */
+    canvas { width: 100%; height: calc(100dvh - 110px); background:#000; border-radius: 10px; }
+    .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button, select, input[type=checkbox], label { font-size:16px; }
+    .pill { background:#222; padding:8px 12px; border-radius:999px; }
+    .note { font-weight:700; }
+    .small { opacity:.7; font-size: 12px; }
+    a { color:#8fd; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="bar">
+      <button id="startBtn">▶️ Start</button>
+      <button id="flipBtn">🔁 Flip camera</button>
+      <label class="pill"><input id="envCam" type="checkbox" /> Use rear camera</label>
+      <label class="pill">Scale:
+        <select id="scaleSel">
+          <option value="C_major" selected>C major</option>
+          <option value="A_minor">A minor</option>
+          <option value="pentatonic_C">C pentatonic</option>
+          <option value="chromatic">Chromatic</option>
+        </select>
+      </label>
+      <span class="pill">Note: <span id="noteOut" class="note">—</span></span>
+      <span class="pill small">Pinch (thumb+index) to play • Lift to stop</span>
+    </div>
+
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="small">
+      Tips: Use HTTPS. On iOS, tap <b>Start</b> first (user gesture is required for audio). Good lighting helps tracking.
+    </div>
+  </div>
+
+  <!-- MediaPipe Hands + helpers from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+  <script>
+    // ====== DOM ======
+    const startBtn = document.getElementById('startBtn');
+    const flipBtn = document.getElementById('flipBtn');
+    const envCamChk = document.getElementById('envCam');
+    const scaleSel = document.getElementById('scaleSel');
+    const noteOut = document.getElementById('noteOut');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Resize canvas to fill CSS box
+    const resizeCanvas = () => {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.floor(rect.width * window.devicePixelRatio || 1);
+      canvas.height = Math.floor(rect.height * window.devicePixelRatio || 1);
+    };
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ====== Audio setup ======
+    let audioCtx, osc, gain;
+    let noteOn = false;
+
+    function initAudio() {
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      osc = audioCtx.createOscillator();
+      gain = audioCtx.createGain();
+      gain.gain.value = 0; // start silent
+      osc.type = 'sine';
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+    }
+
+    function setFrequency(hz) {
+      if (!osc) return;
+      // Smooth transitions
+      try {
+        const now = audioCtx.currentTime;
+        osc.frequency.cancelScheduledValues(now);
+        osc.frequency.linearRampToValueAtTime(hz, now + 0.03);
+      } catch {}
+    }
+
+    function gate(open) {
+      if (!gain) return;
+      const now = audioCtx.currentTime;
+      const target = open ? 0.15 : 0.0001; // simple envelope
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.exponentialRampToValueAtTime(Math.max(target, 0.0001), now + (open ? 0.01 : 0.06));
+      noteOn = open;
+    }
+
+    // ====== Music helpers ======
+    const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const scales = {
+      'C_major':    {root: 60, steps:[0,2,4,5,7,9,11]}, // MIDI
+      'A_minor':    {root: 57, steps:[0,2,3,5,7,8,10]},
+      'pentatonic_C': {root: 60, steps:[0,2,4,7,9]},
+      'chromatic':  {root: 60, steps:[0,1,2,3,4,5,6,7,8,9,10,11]},
+    };
+
+    function midiToHz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+    function midiToName(m) {
+      const name = NOTE_NAMES[m % 12];
+      const oct = Math.floor(m / 12) - 1;
+      return `${name}${oct}`;
+    }
+
+    // Map y position (0..1) -> MIDI in a comfortable range
+    function yToMidi(y01, scaleKey) {
+      // invert y so higher hand = higher pitch
+      const inv = 1 - y01;
+      const low = 52;  // E3
+      const high = 76; // E5
+      const raw = low + inv * (high - low);
+
+      // snap to scale
+      if (scaleKey === 'chromatic') return Math.round(raw);
+      const {root, steps} = scales[scaleKey];
+      const semi = Math.round(raw);
+      const octave = Math.floor((semi - root) / 12);
+      const within = (semi - root) - octave * 12;
+      // find nearest degree in 'steps'
+      let best = steps[0], minDiff = Infinity;
+      for (const s of steps) {
+        const diff = Math.abs(s - within);
+        if (diff < minDiff) { minDiff = diff; best = s; }
+      }
+      return root + octave * 12 + best;
+    }
+
+    // ====== MediaPipe Hands ======
+    let cameraFeed = null;
+    let usingRear = false;
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      selfieMode: true,
+      maxNumHands: 1,
+      modelComplexity: 0,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults(onHandsResults);
+
+    function startCamera() {
+      if (cameraFeed) {
+        cameraFeed.stop();
+        cameraFeed = null;
+      }
+      // selfieMode toggles mirror; device selection below
+      hands.setOptions({ selfieMode: !usingRear });
+
+      // Use MediaPipe's Camera helper
+      cameraFeed = new Camera(video, {
+        onFrame: async () => {
+          await hands.send({ image: video });
+        },
+        // prefer front or rear
+        facingMode: usingRear ? 'environment' : 'user',
+        width: 640,
+        height: 480,
+      });
+      cameraFeed.start();
+    }
+
+    // ====== Interaction ======
+    startBtn.addEventListener('click', async () => {
+      initAudio();
+      try {
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+      } catch {}
+      startCamera();
+    });
+
+    flipBtn.addEventListener('click', () => {
+      usingRear = !usingRear;
+      envCamChk.checked = usingRear;
+      startCamera();
+    });
+    envCamChk.addEventListener('change', () => {
+      usingRear = envCamChk.checked;
+      startCamera();
+    });
+
+    // ====== Drawing & control ======
+    function onHandsResults(results) {
+      draw(results);
+      driveSound(results);
+    }
+
+    function draw({image, multiHandLandmarks}) {
+      // Draw camera frame
+      ctx.save();
+      // Clear
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Draw the video frame scaled to canvas
+      // Create an offscreen to draw video -> canvas with correct pixel ratio
+      // (video.width/height might be 0 initially; guard)
+      try {
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      } catch {}
+      // Overlay landmarks
+      if (multiHandLandmarks && multiHandLandmarks.length) {
+        for (const lm of multiHandLandmarks) {
+          // connections
+          drawConnectors(ctx, lm, HAND_CONNECTIONS, { lineWidth: 3 });
+          // points
+          drawLandmarks(ctx, lm, { radius: 4 });
+        }
+      }
+      ctx.restore();
+    }
+
+    function driveSound({multiHandLandmarks}) {
+      if (!multiHandLandmarks || !multiHandLandmarks.length) {
+        gate(false);
+        noteOut.textContent = '—';
+        return;
+      }
+      const lm = multiHandLandmarks[0];
+      // Landmarks are in normalized [0..1] coords
+      const tip = lm[8];   // index fingertip
+      const thumb = lm[4]; // thumb tip
+
+      const y = tip.y; // 0 top, 1 bottom
+      const midi = yToMidi(y, scaleSel.value);
+      const freq = midiToHz(midi);
+      setFrequency(freq);
+
+      // Pinch detection (distance in normalized space)
+      const dx = tip.x - thumb.x;
+      const dy = tip.y - thumb.y;
+      const dz = (tip.z || 0) - (thumb.z || 0);
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      const pinched = dist < 0.06; // tweak threshold as you like
+      gate(pinched);
+
+      noteOut.textContent = pinched ? `${midiToName(midi)} (${freq.toFixed(1)} Hz)` : '—';
+
+      // Visual feedback circle for pitch line
+      const cy = (1 - (midi - 52) / (76 - 52)); // reuse mapping to draw target line
+      const ypx = cy * canvas.height;
+      ctx.beginPath();
+      ctx.moveTo(0, ypx);
+      ctx.lineTo(canvas.width, ypx);
+      ctx.lineWidth = 2;
+      ctx.setLineDash([10, 8]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  </script>
+</body>
+</html>
